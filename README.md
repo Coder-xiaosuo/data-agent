@@ -1,1 +1,188 @@
 # data-agent
+
+一个从零搭建的、以 Harness 设计能力为核心的智能数据分析 Agent。
+
+## 这个项目是什么
+
+data-agent 接收自然语言分析问题，自主完成 schema 读取、SQL 生成、执行、结果验证，返回分析结论。
+
+它不是一个功能导向的项目，而是一个**系统设计导向**的项目。功能覆盖窄，但每一层都有可讲的设计决策。核心目标是展示 Harness 层的设计能力：状态管理、循环钩子、工具结果验证、失败恢复。
+
+**不基于 LangGraph、AgentScope 等上层 Agent 框架。** 从原生 SDK 起步，Harness 的每一层都是显式设计决策，而非框架的默认行为。
+
+## 当前阶段与边界
+
+MVP 阶段的能力边界如下：
+
+| 维度 | MVP 边界 | 后续演进 |
+|---|---|---|
+| SQL 能力 | L1 单表查询（SELECT / WHERE / GROUP BY） | L2 多表 JOIN → L3 复杂分析 |
+| 分析能力 | L2 单步分析，最多 5 步，不给因果结论 | L3 多步归因 |
+| Harness 能力 | 工具结果验证 + 循环钩子 | 上下文压缩、状态持久化、沙箱隔离 |
+| 数据库 | 仅 MySQL | 多方言适配 |
+| 模型 | 仅接一个模型 | 多模型适配 |
+
+**分析能力边界的含义**：Agent 可以在用户指定的问题范围内自主规划分析路径、有限下钻（一到两个维度），但最多 5 步分析，超过则输出阶段性结论。Agent 只给相关性和事实，不给因果结论。
+
+## MVP 验收标准
+
+以可验证的行为描述为准，而非功能列表：
+
+- [ ] 终端输入自然语言问题，Agent 完成“读 schema → 生成 SQL → 执行 → 验证 → 返回答案”完整链路
+- [ ] `AgentState` 完整记录每一步的输入输出和中间结果
+- [ ] 循环钩子在 LLM 调用前后、工具调用前后均触发，日志可查
+- [ ] SQL 返回空结果时，验证层触发，Agent 调整策略而非重复同一查询
+- [ ] 超过 5 步分析上限时，Agent 输出阶段性结论而非继续探索
+- [ ] `run_sql()` 拒绝非 SELECT 语句、拒绝多语句、自动追加 LIMIT
+
+## 不做清单
+
+MVP 阶段明确不做以下事项，每条附理由：
+
+- **不做前后端、网关层、多数据库适配**——这些是外围适配，与 Harness 验证无关
+- **不做上下文压缩、外部持久化、沙箱隔离**——MVP 先验证循环内状态记录是否完整
+- **不做因果归因、跨问题分析、预测性分析**——因果验证成本极高，Harness 层尚不具备验证能力
+- **不做多模型适配**——只接一个模型，接口留好即可
+- **不做流式输出**——输入输出契约稳定后再考虑
+
+## 分层架构
+
+```
+dataagent/
+├── llm/              # 模型适配层
+│   └── client.py     # LLMClient 接口 + 一个实现
+├── agent/            # agent loop 层
+│   ├── state.py      # AgentState 定义
+│   ├── loop.py       # ReAct 循环 + 钩子
+│   └── tools.py      # 工具注册与契约
+├── nl2sql/           # nl2sql 层
+│   ├── schema.py     # MySQL schema 读取
+│   └── executor.py   # run_sql() + 护栏
+├── harness/          # harness 中间件层
+│   ├── hooks.py      # 循环钩子接口
+│   └── validator.py  # 结果验证
+└── main.py           # 终端入口
+```
+
+层间依赖关系：
+
+- `llm/` 向 `agent/` 暴露 `chat()` 和 `chat_with_tools()`
+- `nl2sql/` 向 `agent/` 暴露 `run_sql()`
+- `harness/` 挂在 `agent/` 的循环钩子上
+- `agent/` 不直接依赖 `nl2sql/` 的具体实现，只依赖工具契约
+
+## 核心契约
+
+### AgentState
+
+各层开发的公共依赖，也是后续做检查点、恢复、上下文压缩的载体。
+
+```python
+@dataclass
+class AgentState:
+    task: str                          # 当前任务描述
+    steps: list[StepRecord]            # 已执行步骤列表
+    findings: list[Finding]            # 结构化分析发现
+    errors: list[ErrorRecord]          # 错误历史
+    current_step: int                  # 当前步骤索引
+    status: str                        # running / done / failed / max_steps_reached
+
+@dataclass
+class StepRecord:
+    step_index: int
+    tool_name: str                     # 工具名（read_schema / run_sql / ...）
+    input: dict                        # 工具输入
+    output: dict                       # 工具输出
+    duration_ms: int
+    timestamp: datetime
+
+@dataclass
+class Finding:
+    dimension: str                     # 分析维度（如"省份"、"品类"）
+    observation: str                   # 发现描述
+    supporting_data: dict              # 支撑数据
+    is_anomaly: bool                   # 是否异常
+
+@dataclass
+class ErrorRecord:
+    step_index: int
+    error_type: str                    # syntax_error / field_not_found / timeout / ...
+    message: str
+    recovered: bool                    # 是否已恢复
+```
+
+### run_sql()
+
+所有模型生成的 SQL 都从这里过，是唯一的 chokepoint。
+
+```python
+def run_sql(sql: str) -> SqlResult:
+    """
+    护栏：
+    - 只允许 SELECT / WITH
+    - 拒绝多语句（分号分割）
+    - 自动追加 LIMIT（若模型未写）
+    - 查询超时（默认 30s）
+    - 只读连接
+    """
+
+@dataclass
+class SqlResult:
+    rows: list[dict] | None            # 数据行
+    row_count: int | None              # 行数
+    execution_time_ms: int | None      # 执行时间
+    error: SqlError | None             # 结构化错误
+
+@dataclass
+class SqlError:
+    error_type: str                    # syntax_error / field_not_found / timeout / permission_denied
+    message: str                       # 原始错误信息
+    model_friendly_message: str        # 格式化后供模型理解的错误描述
+```
+
+### 循环钩子
+
+MVP 阶段钩子内只做日志，但接口要在。这是后续加检查点、人工审批、上下文压缩的插入点。
+
+```python
+class LoopHooks:
+    def before_llm(self, state: AgentState, messages: list) -> None: ...
+    def after_llm(self, state: AgentState, response) -> None: ...
+    def before_tool(self, state: AgentState, tool_name: str, input: dict) -> None: ...
+    def after_tool(self, state: AgentState, tool_name: str, output: dict) -> None: ...
+    def before_exit(self, state: AgentState) -> None: ...
+```
+
+## 评测系统
+
+评测系统分两个阶段实现，**先做 Harness 评测，再做效果评测**。
+
+**阶段一：Harness 评测**（MVP 阶段）
+确定性断言，验证机制正确性，不依赖模型表现。评的是状态记录是否完整、钩子是否触发、验证层是否按预期工作、恢复逻辑是否正确。通过率应接近 100%——未通过说明 Harness 实现有 bug。
+
+**阶段二：效果评测**（MVP 之后）
+在 Harness 稳定的基础上，评 Agent 的分析质量。按分析链路分段评：Schema 理解、SQL 正确性、分析路径合理性、结论可信度。重点是失败归因，而非总分。
+
+两个评测分开的核心目的：**当 Agent 表现不好时，能区分是 Harness 层的问题，还是模型能力的问题。**
+
+## 技术栈
+
+- 语言：Python 3.11+
+- 模型：OpenAI API（单模型，接口留扩展空间）
+- 数据库：MySQL（只读连接）
+- Agent 编排：原生 SDK，不引入上层框架
+- 评测：自研，分为 Harness 评测和效果评测两阶段
+
+## 项目状态
+
+MVP 开发中。当前优先级：定义 `AgentState` 与 `run_sql()` 契约 → 实现最小 Agent 循环 → 挂载 Harness 钩子与验证层 → 跑通 Harness 评测。
+
+---
+
+以上是草稿。你可以重点 review 这几个地方：
+
+1. **边界描述是否准确**——尤其是分析能力边界和 SQL 能力边界的对应关系
+2. **契约字段是否合理**——`AgentState` 和 `SqlResult` 的字段有没有遗漏或冗余
+3. **不做清单**——有没有你其实想做的、但被误列入“不做”的
+4. **技术栈**——模型选择、Python 版本等是否和你实际情况一致
+5. **验收标准**——是否可验证，有没有太模糊的条目

@@ -1,0 +1,33 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="fastapi" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="akshare" />
+          <option value="pandas" />
+          <option value="pyarrow" />
+          <option value="sqlalchemy" />
+          <option value="pymysql" />
+          <option value="pyjwt" />
+          <option value="python-dotenv" />
+          <option value="openai" />
+          <option value="langgraph" />
+          <option value="langchain-openai" />
+          <option value="chromadb" />
+          <option value="deepagents" />
+          <option value="langgraph-checkpoint-mysql" />
+          <option value="aiomysql" />
+          <option value="langgraph-checkpoint-redis" />
+          <option value="redis" />
+          <option value="apscheduler" />
+          <option value="matplotlib" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
