@@ -43,7 +43,6 @@ MVP 阶段明确不做以下事项，每条附理由：
 - **不做上下文压缩、外部持久化、沙箱隔离**——MVP 先验证循环内状态记录是否完整
 - **不做因果归因、跨问题分析、预测性分析**——因果验证成本极高，Harness 层尚不具备验证能力
 - **不做多模型适配**——只接一个模型，接口留好即可
-- **不做流式输出**——输入输出契约稳定后再考虑
 
 ## 分层架构
 
@@ -66,7 +65,7 @@ dataagent/
 
 层间依赖关系：
 
-- `llm/` 向 `agent/` 暴露 `chat()` 和 `chat_with_tools()`
+- `llm/` 向 `agent/` 暴露 `chat()`、`chat_stream()` 与 `aggregate_stream()`；工具调用通过 `tools` 参数传入，流式与非流式共用同一套归一化结果（流式只改变怎么展示，不改变怎么决策）
 - `nl2sql/` 向 `agent/` 暴露 `run_sql()`
 - `harness/` 挂在 `agent/` 的循环钩子上
 - `agent/` 不直接依赖 `nl2sql/` 的具体实现，只依赖工具契约
@@ -77,81 +76,16 @@ dataagent/
 
 各层开发的公共依赖，也是后续做检查点、恢复、上下文压缩的载体。
 
-```python
-@dataclass
-class AgentState:
-    task: str                          # 当前任务描述
-    steps: list[StepRecord]            # 已执行步骤列表
-    findings: list[Finding]            # 结构化分析发现
-    errors: list[ErrorRecord]          # 错误历史
-    current_step: int                  # 当前步骤索引
-    status: str                        # running / done / failed / max_steps_reached
-
-@dataclass
-class StepRecord:
-    step_index: int
-    tool_name: str                     # 工具名（read_schema / run_sql / ...）
-    input: dict                        # 工具输入
-    output: dict                       # 工具输出
-    duration_ms: int
-    timestamp: datetime
-
-@dataclass
-class Finding:
-    dimension: str                     # 分析维度（如"省份"、"品类"）
-    observation: str                   # 发现描述
-    supporting_data: dict              # 支撑数据
-    is_anomaly: bool                   # 是否异常
-
-@dataclass
-class ErrorRecord:
-    step_index: int
-    error_type: str                    # syntax_error / field_not_found / timeout / ...
-    message: str
-    recovered: bool                    # 是否已恢复
-```
 
 ### run_sql()
 
 所有模型生成的 SQL 都从这里过，是唯一的 chokepoint。
 
-```python
-def run_sql(sql: str) -> SqlResult:
-    """
-    护栏：
-    - 只允许 SELECT / WITH
-    - 拒绝多语句（分号分割）
-    - 自动追加 LIMIT（若模型未写）
-    - 查询超时（默认 30s）
-    - 只读连接
-    """
-
-@dataclass
-class SqlResult:
-    rows: list[dict] | None            # 数据行
-    row_count: int | None              # 行数
-    execution_time_ms: int | None      # 执行时间
-    error: SqlError | None             # 结构化错误
-
-@dataclass
-class SqlError:
-    error_type: str                    # syntax_error / field_not_found / timeout / permission_denied
-    message: str                       # 原始错误信息
-    model_friendly_message: str        # 格式化后供模型理解的错误描述
-```
 
 ### 循环钩子
 
 MVP 阶段钩子内只做日志，但接口要在。这是后续加检查点、人工审批、上下文压缩的插入点。
 
-```python
-class LoopHooks:
-    def before_llm(self, state: AgentState, messages: list) -> None: ...
-    def after_llm(self, state: AgentState, response) -> None: ...
-    def before_tool(self, state: AgentState, tool_name: str, input: dict) -> None: ...
-    def after_tool(self, state: AgentState, tool_name: str, output: dict) -> None: ...
-    def before_exit(self, state: AgentState) -> None: ...
-```
 
 ## 评测系统
 

@@ -47,3 +47,36 @@ class LLMResponse(BaseModel):
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
+
+
+# 流式：工具调用的单个分片
+class ToolCallDelta(BaseModel):
+    """工具调用的增量分片。
+
+    流式响应里一次工具调用的信息是拆开到达的：首个分片带 id 与 name，
+    后续分片只带 arguments 的字符串碎片。`index` 是拼回完整调用的唯一依据。
+    """
+    index: int
+    id: str | None = None
+    name: str | None = None
+    arguments_delta: str | None = None   # JSON 字符串的片段，不是完整 JSON
+
+
+# 流式：单个增量分片
+class LLMStreamChunk(BaseModel):
+    """一次流式响应的增量分片。
+
+    注意 finish_reason 与 usage 只在特定分片上出现：
+    - finish_reason 仅出现在最后一个内容分片
+    - usage 仅在开启 include_usage 时的末尾空分片（其 choices 为空列表）
+    """
+    content_delta: str | None = None
+    tool_call_deltas: list[ToolCallDelta] = Field(default_factory=list)
+    finish_reason: FinishReason | None = None   # 未到达结束分片时为 None，区别于 UNKNOWN
+    usage: Usage | None = None                  # 未携带用量时为 None，区别于全零
+    model: str = ""
+    raw_data: dict | None = None
+
+    @property
+    def has_tool_call_deltas(self) -> bool:
+        return bool(self.tool_call_deltas)
